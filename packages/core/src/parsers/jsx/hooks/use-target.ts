@@ -25,6 +25,7 @@ const TARGETS: Record<Target, null> = {
   lit: null,
   rsc: null,
   taro: null,
+  astro: null
 };
 
 const { types } = babel;

@@ -21,6 +21,7 @@ import { componentToSwift as swift } from './generators/swift';
 import { componentToTaro as taro } from './generators/taro';
 import { componentToTemplate as template } from './generators/template';
 import { componentToVue as vue } from './generators/vue';
+import { componentToAstro as astro } from './generators/astro';
 
 export const builder = componentToBuilder;
 
@@ -46,6 +47,7 @@ export const targets = {
   lit,
   rsc,
   taro,
+  astro
 } as const;
 
 export type Targets = keyof typeof targets;
