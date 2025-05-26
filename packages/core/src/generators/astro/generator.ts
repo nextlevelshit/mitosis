@@ -21,306 +21,401 @@ import { TranspilerGenerator } from '@/types/transpiler';
 import { SELF_CLOSING_HTML_TAGS } from '@/constants/html_tags';
 import hash from 'hash-sum';
 import { kebabCase, camelCase } from 'lodash';
-import { format } from 'prettier/standalone';
 import { ToAstroOptions } from './types';
 
-// Implement proper class string collection for Astro
-const collectClassString = (json: MitosisNode, options: InternalToAstroOptions): string => {
+interface InternalToAstroOptions extends ToAstroOptions {
+	component: MitosisComponent;
+	cssInJs?: Map<string, string>;
+	clientBoundaryComponents?: Set<string>;
+}
+
+// Astro v5 specific client directives
+const CLIENT_DIRECTIVES = {
+	load: 'client:load',
+	idle: 'client:idle',
+	visible: 'client:visible',
+	media: 'client:media',
+	only: 'client:only'
+} as const;
+
+// Events that require client-side hydration
+const INTERACTIVE_EVENTS = new Set([
+	'onClick', 'onChange', 'onInput', 'onSubmit', 'onFocus', 'onBlur',
+	'onMouseOver', 'onMouseOut', 'onMouseEnter', 'onMouseLeave',
+	'onKeyDown', 'onKeyUp', 'onKeyPress', 'onScroll', 'onResize',
+	'onLoad', 'onError', 'onAbort', 'onCanPlay', 'onCanPlayThrough',
+	'onDurationChange', 'onEmptied', 'onEnded', 'onLoadedData',
+	'onLoadedMetadata', 'onLoadStart', 'onPause', 'onPlay',
+	'onPlaying', 'onProgress', 'onRateChange', 'onSeeked',
+	'onSeeking', 'onStalled', 'onSuspend', 'onTimeUpdate',
+	'onVolumeChange', 'onWaiting', 'onWheel'
+]);
+
+/**
+ * Determines if a component needs client-side hydration
+ * Based on presence of refs, interactive events, or lifecycle hooks
+ */
+function analyzeHydrationNeeds(json: MitosisComponent): {
+	needsHydration: boolean;
+	reason: string[];
+	suggestedDirective: string;
+} {
+	const reasons: string[] = [];
+	let needsHydration = false;
+
+	// Check for refs (always need client hydration)
+	const refs = getRefs(json);
+	if (refs.size > 0) {
+		needsHydration = true;
+		reasons.push(`Component uses ${refs.size} ref(s): ${Array.from(refs).join(', ')}`);
+	}
+
+	// Check for client-side lifecycle hooks
+	if (json.hooks.onMount?.length > 0) {
+		needsHydration = true;
+		reasons.push(`Component has ${json.hooks.onMount.length} onMount hook(s)`);
+	}
+
+	if (json.hooks.onUpdate) {
+		needsHydration = true;
+		reasons.push(`Component has ${json.hooks.onUpdate.length} onUpdate hook(s)`);
+	}
+
+	// Check for event handlers in component tree
+	let hasInteractiveEvents = false;
+	function checkNodeForInteractivity(node: MitosisNode): void {
+		for (const key in node.bindings) {
+			if (INTERACTIVE_EVENTS.has(key)) {
+				hasInteractiveEvents = true;
+				reasons.push(`Found interactive event: ${key} on ${node.name}`);
+				return;
+			}
+		}
+		node.children?.forEach(checkNodeForInteractivity);
+	}
+
+	json.children?.forEach(checkNodeForInteractivity);
+	if (hasInteractiveEvents) needsHydration = true;
+
+	// Suggest appropriate directive based on usage patterns
+	let suggestedDirective: any = CLIENT_DIRECTIVES.load;
+	if (hasInteractiveEvents && !refs.size) {
+		suggestedDirective = CLIENT_DIRECTIVES.idle; // Defer non-critical interactions
+	}
+	if (reasons.some(r => r.includes('onMount'))) {
+		suggestedDirective = CLIENT_DIRECTIVES.load; // Mount hooks need immediate loading
+	}
+
+	return { needsHydration, reason: reasons, suggestedDirective };
+}
+
+/**
+ * Enhanced class string collection for Astro v5
+ * Handles static classes, dynamic bindings, and CSS-in-JS properly
+ */
+function collectClassString(node: MitosisNode, options: InternalToAstroOptions): string {
 	const classes: string[] = [];
 
-	// Handle static class/className properties
-	if (json.properties.class) {
-		classes.push(`"${json.properties.class}"`);
+	// Static class properties
+	if (node.properties.class?.trim()) {
+		classes.push(`"${node.properties.class.trim()}"`);
 	}
-	if (json.properties.className) {
-		classes.push(`"${json.properties.className}"`);
-	}
-
-	// Handle dynamic class bindings
-	if (json.bindings.class?.code) {
-		const classCode = processBinding(options.component, json.bindings.class.code, 'template');
-		classes.push(`${classCode}`);
-	}
-	if (json.bindings.className?.code) {
-		const classCode = processBinding(options.component, json.bindings.className.code, 'template');
-		classes.push(`${classCode}`);
+	if (node.properties.className?.trim()) {
+		classes.push(`"${node.properties.className.trim()}"`);
 	}
 
-	// Handle CSS-in-JS (css prop)
-	if (json.bindings.css?.code) {
-		// Generate a scoped class name for CSS-in-JS
-		const cssHash = hash(json.bindings.css.code);
-		const scopedClassName = `${json.name}-${cssHash}`;
+	// Dynamic class bindings
+	if (node.bindings.class?.code?.trim()) {
+		const processedCode = processBinding(node.bindings.class.code, 'template', options);
+		classes.push(`(${processedCode})`);
+	}
+	if (node.bindings.className?.code?.trim()) {
+		const processedCode = processBinding(node.bindings.className.code, 'template', options);
+		classes.push(`(${processedCode})`);
+	}
+
+	// CSS-in-JS handling - convert to scoped class
+	if (node.bindings.css?.code?.trim()) {
+		const cssHash = hash(node.bindings.css.code);
+		const scopedClassName = `${kebabCase(node.name || 'element')}-${cssHash}`;
 		classes.push(`"${scopedClassName}"`);
 
-		// Store CSS-in-JS for later processing in styles
+		// Store for style generation
 		if (!options.cssInJs) options.cssInJs = new Map();
-		options.cssInJs.set(scopedClassName, json.bindings.css.code);
+		options.cssInJs.set(scopedClassName, node.bindings.css.code);
 	}
 
 	if (classes.length === 0) return '';
 
-	// If only one class and it's a simple string, return it directly
+	// Single static class - no expression needed
 	if (classes.length === 1 && classes[0].startsWith('"') && classes[0].endsWith('"')) {
-		return classes[0];
+		return `class=${classes[0]}`;
 	}
 
-	// Multiple classes or dynamic classes need expression syntax
-	return `{[${classes.join(', ')}].filter(Boolean).join(' ')}`;
-};
-
-interface InternalToAstroOptions extends ToAstroOptions {
-	component: MitosisComponent;
-	cssInJs?: Map<string, string>; // Store CSS-in-JS styles
+	// Multiple or dynamic classes need expression syntax
+	const classExpression = `{[${classes.join(', ')}].filter(Boolean).join(' ')}`;
+	return `class=${classExpression}`;
 }
 
-// Map of Mitosis events to Astro client directives
-const HYDRATION_EVENTS = new Set([
-	'onClick', 'onChange', 'onInput', 'onSubmit', 'onFocus', 'onBlur',
-	'onMouseOver', 'onMouseOut', 'onKeyDown', 'onKeyUp', 'onScroll',
-]);
-
-// Check if component needs client-side hydration
-function needsHydration(json: MitosisComponent): boolean {
-	let needsClient = false;
-
-	// Check for refs (always need hydration)
-	const refs = getRefs(json);
-	if (refs.size > 0) needsClient = true;
-
-	// Check for interactive hooks
-	if (json.hooks.onMount.length > 0) needsClient = true;
-	if (json.hooks.onUpdate) needsClient = true;
-
-	// Check for event handlers in the tree
-	function checkNodeForEvents(node: MitosisNode): boolean {
-		for (const key in node.bindings) {
-			if (checkIsEvent(key)) return true;
-		}
-		return node.children.some(checkNodeForEvents);
-	}
-
-	if (json.children.some(checkNodeForEvents)) needsClient = true;
-
-	return needsClient;
-}
-
-// Process bindings for Astro context (frontmatter vs template)
+/**
+ * Process code bindings for different Astro contexts
+ * Handles state/props references and context-specific transformations
+ */
 function processBinding(
-	json: MitosisComponent,
 	code: string,
-	context: 'frontmatter' | 'template' = 'template',
+	context: 'frontmatter' | 'template',
+	options: InternalToAstroOptions
 ): string {
+	if (!code?.trim()) return '';
+
 	try {
-		// In frontmatter, state and props are direct variables
-		// In template, they need to be referenced appropriately
 		let processed = code;
 
 		if (context === 'template') {
-			// Replace state.foo with just foo in template expressions
+			// In template expressions, state and props are available as variables
 			processed = processed.replace(/\bstate\.(\w+)/g, '$1');
-			// Replace props.foo with just foo in template expressions
 			processed = processed.replace(/\bprops\.(\w+)/g, '$1');
 		} else if (context === 'frontmatter') {
-			// In frontmatter, keep state references but make them proper variable declarations
+			// In frontmatter, maintain proper variable scope
 			processed = processed.replace(/\bstate\.(\w+)/g, '$1');
 			processed = processed.replace(/\bprops\.(\w+)/g, 'props.$1');
 		}
 
+		// Handle common transformations
+		processed = babelTransformExpression(processed, {
+			// Transform object property access for style objects
+			ObjectExpression(path: any) {
+				if (context === 'template') {
+					path.node.properties?.forEach((prop: any) => {
+						if (prop.key?.name && typeof prop.key.name === 'string') {
+							// Convert camelCase to kebab-case for CSS properties
+							const kebabKey = kebabCase(prop.key.name);
+							if (kebabKey !== prop.key.name) {
+								prop.key.value = kebabKey;
+								prop.key.type = 'StringLiteral';
+							}
+						}
+					});
+				}
+			}
+		});
+
 		return processed;
 	} catch (error) {
-		console.error('Astro: could not process binding', code);
-		return code;
+		console.warn(`Astro: Failed to process binding "${code}":`, error);
+		return code; // Fallback to original code
 	}
 }
 
-// Convert CSS-in-JS object to CSS string
+/**
+ * Convert CSS object syntax to CSS string
+ */
 function cssObjectToString(cssCode: string): string {
 	try {
-		// This is a simplified CSS-in-JS parser
-		// In a real implementation, you'd want to use a proper CSS-in-JS parser
-		const cssObj = new Function('return ' + cssCode)();
+		// Simple CSS-in-JS object parser
+		// Remove any surrounding parentheses or brackets
+		const cleaned = cssCode.replace(/^\s*[\(\{]\s*|\s*[\)\}]\s*$/g, '');
+
+		// Try to evaluate as object literal
+		const cssObj = new Function(`return {${cleaned}}`)();
 
 		let cssString = '';
 		for (const [property, value] of Object.entries(cssObj)) {
-			const cssProperty = property.replace(/([A-Z])/g, '-$1').toLowerCase();
+			const cssProperty = kebabCase(property);
 			cssString += `  ${cssProperty}: ${value};\n`;
 		}
 
 		return cssString;
 	} catch (error) {
-		console.warn('Could not parse CSS-in-JS:', cssCode);
-		return '';
+		console.warn('Could not parse CSS-in-JS object:', cssCode);
+		// Fallback: try to format as-is
+		return `  /* Generated from: ${cssCode} */\n`;
 	}
 }
 
-// Convert Mitosis node to Astro template
-const blockToAstro = (json: MitosisNode, options: InternalToAstroOptions): string => {
+/**
+ * Convert individual Mitosis node to Astro template syntax
+ */
+function blockToAstro(node: MitosisNode, options: InternalToAstroOptions): string {
 	// Handle text nodes
-	if (json.properties._text) {
-		return json.properties._text;
+	if (node.properties._text) {
+		return node.properties._text;
 	}
-	if (json.bindings._text?.code) {
-		return `{${processBinding(options.component, json.bindings._text.code, 'template')}}`;
-	}
-
-	// Handle Fragment
-	if (json.name === 'Fragment') {
-		return json.children.map((child) => blockToAstro(child, options)).join('\n');
+	if (node.bindings._text?.code) {
+		const processedCode = processBinding(node.bindings._text.code, 'template', options);
+		return `{${processedCode}}`;
 	}
 
-	// Handle For loops
-	if (checkIsForNode(json)) {
-		const forArguments = getForArguments(json);
-		const [itemName, indexName] = forArguments;
-		const eachCode = processBinding(options.component, json.bindings.each?.code as string, 'template');
+	// Handle Fragment - render children without wrapper
+	if (node.name === 'Fragment') {
+		return node.children
+			?.filter(filterEmptyTextNodes)
+			.map(child => blockToAstro(child, options))
+			.join('\n') || '';
+	}
+
+	// Handle For loops - convert to Astro map syntax
+	if (checkIsForNode(node)) {
+		const forArgs = getForArguments(node);
+		const [itemName, indexName] = forArgs;
+		const eachCode = processBinding(node.bindings.each?.code || '', 'template', options);
+
+		const childrenContent = node.children
+			?.filter(filterEmptyTextNodes)
+			.map(child => blockToAstro(child, options))
+			.join('\n') || '';
 
 		return `{${eachCode}.map((${itemName}${indexName ? `, ${indexName}` : ''}) => (
-      ${json.children
-			.filter(filterEmptyTextNodes)
-			.map((item) => blockToAstro(item, options))
-			.join('\n')}
+      ${childrenContent}
     ))}`;
 	}
 
-	// Handle Show conditionals
-	if (json.name === 'Show') {
-		const whenCode = processBinding(options.component, json.bindings.when?.code as string, 'template');
-		const elseBlock = json.meta.else ? blockToAstro(json.meta.else as MitosisNode, options) : '';
+	// Handle Show conditionals - convert to ternary
+	if (node.name === 'Show') {
+		const whenCode = processBinding(node.bindings.when?.code || '', 'template', options);
+		const childrenContent = node.children
+			?.filter(filterEmptyTextNodes)
+			.map(child => blockToAstro(child, options))
+			.join('\n') || '';
+
+		const elseContent = node.meta?.else
+			? blockToAstro(node.meta.else as MitosisNode, options)
+			: 'null';
 
 		return `{${whenCode} ? (
-      ${json.children
-			.filter(filterEmptyTextNodes)
-			.map((item) => blockToAstro(item, options))
-			.join('\n')}
-    ) : ${elseBlock ? `(${elseBlock})` : 'null'}}`;
+      ${childrenContent}
+    ) : (${elseContent})}`;
 	}
 
-	let str = `<${json.name}`;
+	// Handle regular elements
+	let elementString = `<${node.name}`;
 
 	// Handle class/className with proper collection
-	const classString = collectClassString(json, options);
-	if (classString) {
-		str += ` class=${classString}`;
+	const classAttr = collectClassString(node, options);
+	if (classAttr) {
+		elementString += ` ${classAttr}`;
 	}
 
-	// Handle properties (excluding class/className as they're handled above)
-	for (const key in json.properties) {
-		if (key === 'class' || key === 'className') continue;
-		const value = json.properties[key];
-		str += ` ${key}="${value}"`;
+	// Handle static properties (excluding class/className)
+	for (const [key, value] of Object.entries(node.properties)) {
+		if (key === 'class' || key === 'className' || key === '_text') continue;
+		elementString += ` ${key}="${value}"`;
 	}
 
-	// Handle bindings
-	let hasClientDirective = false;
-	for (const key in json.bindings) {
-		if (key === 'class' || key === 'className' || key === 'css') continue; // Handled above
+	// Handle dynamic bindings
+	let needsClientDirective = false;
+	for (const [key, binding] of Object.entries(node.bindings)) {
+		if (!binding?.code?.trim()) continue;
+		if (key === 'class' || key === 'className' || key === 'css' || key === '_text') continue;
 
-		const { code, arguments: cusArgs = ['event'], type, async } = json.bindings[key]!;
-		if (!code) continue;
+		const { code, arguments: bindingArgs = ['event'] } = binding;
 
-		if (type === 'spread') {
-			str += ` {...(${processBinding(options.component, code, 'template')})}`;
+		if (binding.type === 'spread') {
+			const spreadCode = processBinding(code, 'template', options);
+			elementString += ` {...(${spreadCode})}`;
 		} else if (key === 'ref') {
-			// Refs need client-side hydration
-			str += ` bind:this={${camelCase(code)}}`;
-			hasClientDirective = true;
+			// Refs need client-side handling
+			const refName = camelCase(code);
+			elementString += ` bind:this={${refName}}`;
+			needsClientDirective = true;
 		} else if (checkIsEvent(key)) {
-			// Event handlers need client-side hydration
-			const useKey = key === 'onChange' && json.name === 'input' ? 'onInput' : key;
-			const asyncKeyword = async ? 'async ' : '';
-			str += ` ${useKey}={${asyncKeyword}(${cusArgs.join(',')}) => ${processBinding(options.component, code, 'template')}}`;
+			// Event handlers
+			const eventName = key === 'onChange' && node.name === 'input' ? 'onInput' : key;
+			const handlerCode = processBinding(code, 'template', options);
+			elementString += ` ${eventName}={${binding.async ? 'async ' : ''}(${bindingArgs.join(',')}) => ${handlerCode}}`;
 
-			if (HYDRATION_EVENTS.has(key)) {
-				hasClientDirective = true;
+			if (INTERACTIVE_EVENTS.has(key)) {
+				needsClientDirective = true;
 			}
 		} else if (key === 'innerHTML') {
-			str += ` set:html={${processBinding(options.component, code, 'template')}}`;
+			const htmlCode = processBinding(code, 'template', options);
+			elementString += ` set:html={${htmlCode}}`;
 		} else if (key === 'style') {
-			// Handle style objects by converting camelCase to kebab-case
-			const styleCode = babelTransformExpression(code, {
-				ObjectExpression(path: any) {
-					for (const property of path.node.properties) {
-						if (property.key?.name) {
-							property.key.value = kebabCase(property.key.name);
-							property.key.type = 'StringLiteral';
-						}
-					}
-				},
-			});
-			str += ` style={${processBinding(options.component, styleCode, 'template')}}`;
+			const styleCode = processBinding(code, 'template', options);
+			elementString += ` style={${styleCode}}`;
 		} else {
-			str += ` ${key}={${processBinding(options.component, code, 'template')}}`;
+			// General attribute binding
+			const attrCode = processBinding(code, 'template', options);
+			elementString += ` ${key}={${attrCode}}`;
 		}
 	}
 
-	// Add client directive if needed
-	if (hasClientDirective && options.clientDirective !== 'none') {
-		const directive = options.clientDirective || 'client:load';
-		str += ` ${directive}`;
+	// Add client directive if needed and not disabled
+	if (needsClientDirective && options.clientDirective !== 'none') {
+		const directive = options.clientDirective || CLIENT_DIRECTIVES.idle;
+		elementString += ` ${directive}`;
 	}
 
 	// Handle self-closing tags
-	if (SELF_CLOSING_HTML_TAGS.has(json.name)) {
-		return str + ' />';
+	if (SELF_CLOSING_HTML_TAGS.has(node.name)) {
+		return elementString + ' />';
 	}
 
-	str += '>';
+	elementString += '>';
 
-	// Handle innerHTML separately
-	if (json.bindings.innerHTML?.code) {
-		str += `{${processBinding(options.component, json.bindings.innerHTML.code, 'template')}}`;
-	} else if (json.children) {
-		str += json.children
+	// Handle children
+	if (node.bindings.innerHTML?.code) {
+		// innerHTML takes precedence over children
+		const htmlCode = processBinding(node.bindings.innerHTML.code, 'template', options);
+		elementString += `{${htmlCode}}`;
+	} else if (node.children?.length) {
+		const childrenContent = node.children
 			.filter(filterEmptyTextNodes)
-			.map((item) => blockToAstro(item, options))
+			.map(child => blockToAstro(child, options))
 			.join('\n');
+		elementString += childrenContent;
 	}
 
-	str += `</${json.name}>`;
-	return str;
-};
+	elementString += `</${node.name}>`;
+	return elementString;
+}
 
+/**
+ * Main Astro v5 component generator
+ */
 export const componentToAstro: TranspilerGenerator<ToAstroOptions> =
 	(userOptions = {}) =>
 		({ component }) => {
+			// Clone and initialize
 			let json = fastClone(component);
 			const options = initializeOptions<InternalToAstroOptions>({
 				target: 'astro',
 				component,
 				defaults: {
 					typescript: true,
-					clientDirective: 'client:load',
+					clientDirective: CLIENT_DIRECTIVES.idle,
+					outputFormat: 'astro',
 					cssInJs: new Map(),
+					clientBoundaryComponents: new Set(),
 					...userOptions,
 					component: json,
 				},
 			});
 
-			// Run pre-plugins
+			// Run pre-JSON plugins
 			if (options.plugins) {
 				json = runPreJsonPlugins({ json, plugins: options.plugins });
 			}
 
-			// Collect CSS
+			// Analyze component characteristics
+			const hydrationAnalysis = analyzeHydrationNeeds(json);
+			const hasState = Object.keys(json.state).length > 0;
+			const componentHasProps = hasProps(json);
+			const refs = getRefs(json);
+
+			// Collect CSS with proper prefix
 			const css = collectCss(json, {
 				prefix: hash(json),
 			});
 
-			// Get component data
-			const hasState = Object.keys(json.state).length > 0;
-			const componentHasProps = hasProps(json);
-			const refs = getRefs(json);
-			const needsClient = needsHydration(json);
-
-			// Run post-plugins
+			// Run post-JSON plugins
 			if (options.plugins) {
 				json = runPostJsonPlugins({ json, plugins: options.plugins });
 			}
 			stripMetaProperties(json);
 
-			// Generate frontmatter
-			let frontmatterContent = '';
+			// Generate frontmatter section
+			let frontmatter = '';
 
 			// Add imports
 			const imports = renderPreComponent({
@@ -328,152 +423,147 @@ export const componentToAstro: TranspilerGenerator<ToAstroOptions> =
 				component: json,
 				target: 'astro',
 			});
-
 			if (imports.trim()) {
-				frontmatterContent += imports + '\n\n';
+				frontmatter += imports + '\n\n';
 			}
 
-			// Add props interface if TypeScript is enabled
+			// Add TypeScript interface for props
 			if (options.typescript && componentHasProps) {
 				const propsType = json.propsTypeRef || 'Props';
-				frontmatterContent += `interface ${propsType} {\n`;
-				// Generate prop types based on actual usage - simplified for now
-				Object.keys(json.props || {}).forEach(prop => {
-					frontmatterContent += `  ${prop}?: any;\n`;
-				});
-				frontmatterContent += `}\n\n`;
+				frontmatter += `interface ${propsType} {\n`;
 
-				frontmatterContent += `const props = Astro.props as ${propsType};\n`;
+				if (json.props && Object.keys(json.props).length > 0) {
+					Object.entries(json.props).forEach(([propName, propDef]) => {
+						const propType = propDef?.propertyType || 'any';
+						const optional = propDef?.optional !== false ? '?' : '';
+						frontmatter += `  ${propName}${optional}: ${propType};\n`;
+					});
+				} else {
+					frontmatter += `  [key: string]: any;\n`;
+				}
+
+				frontmatter += `}\n\n`;
+				frontmatter += `const props = Astro.props as ${propsType};\n`;
 			} else if (componentHasProps) {
-				frontmatterContent += `const props = Astro.props;\n`;
+				frontmatter += `const props = Astro.props;\n`;
 			}
 
-			// Add state variables (proper JS declarations)
+			// Add state declarations
 			if (hasState) {
-				frontmatterContent += '\n// Component state\n';
-				Object.entries(json.state).forEach(([key, value]) => {
-					if (typeof value?.code === 'string') {
-						// Handle function state
-						if (value.code.includes('function') || value.code.includes('=>')) {
-							frontmatterContent += `const ${key} = ${processBinding(json, value.code, 'frontmatter')};\n`;
-						} else {
-							// Handle primitive state
-							frontmatterContent += `let ${key} = ${processBinding(json, value.code, 'frontmatter')};\n`;
-						}
-					} else if (value?.code !== undefined) {
-						// Handle non-string values
-						frontmatterContent += `let ${key} = ${JSON.stringify(value.code)};\n`;
+				frontmatter += '\n// Component state\n';
+				Object.entries(json.state).forEach(([key, stateItem]) => {
+					if (!stateItem?.code) return;
+
+					const code = stateItem.code;
+					const processedCode = processBinding(code, 'frontmatter', options);
+
+					// Detect if it's a function
+					const isFunction = typeof code === 'string' && (
+						code.includes('function') ||
+						code.includes('=>') ||
+						/^\s*\([^)]*\)\s*=>/i.test(code)
+					);
+
+					if (isFunction) {
+						frontmatter += `const ${key} = ${processedCode};\n`;
+					} else {
+						frontmatter += `let ${key} = ${processedCode};\n`;
 					}
 				});
 			}
 
 			// Add refs
 			if (refs.size > 0) {
-				frontmatterContent += '\n// Component refs\n';
+				frontmatter += '\n// Component refs\n';
 				Array.from(refs).forEach(ref => {
-					const refName = camelCase(ref);
-					frontmatterContent += `let ${refName};\n`;
+					frontmatter += `let ${camelCase(ref)};\n`;
 				});
 			}
 
-			// Add lifecycle hooks for server-side
+			// Add initialization hooks
 			if (json.hooks.onInit?.code) {
-				frontmatterContent += `\n// Component initialization\n${processBinding(json, json.hooks.onInit.code, 'frontmatter')}\n`;
+				frontmatter += '\n// Component initialization\n';
+				frontmatter += processBinding(json.hooks.onInit.code, 'frontmatter', options) + '\n';
 			}
 
 			// Generate template
-			let templateContent = json.children
-				.filter(filterEmptyTextNodes)
-				.map((item) => blockToAstro(item, options))
-				.join('\n');
+			const template = json.children
+				?.filter(filterEmptyTextNodes)
+				.map(child => blockToAstro(child, options))
+				.join('\n') || '';
 
-			// Add client-side script for interactivity
+			// Generate client-side script for hydration
 			let clientScript = '';
-			if (needsClient && (json.hooks.onMount || json.hooks.onUpdate || refs.size > 0)) {
+			if (hydrationAnalysis.needsHydration) {
 				clientScript = '\n<script>\n';
 
-				// Add onMount hooks
-				if (json.hooks.onMount.length > 0) {
-					clientScript += '  // Component mounted\n';
+				if (json.hooks.onMount?.length > 0) {
+					clientScript += '  // Mount hooks\n';
 					json.hooks.onMount.forEach(hook => {
-						clientScript += `  ${processBinding(json, hook.code, 'template')}\n`;
+						clientScript += `  ${processBinding(hook.code, 'template', options)};\n`;
 					});
 				}
 
-				// Add onUpdate hooks (converted to event listeners or observers)
 				if (json.hooks.onUpdate) {
 					clientScript += '  // Update hooks\n';
 					json.hooks.onUpdate.forEach(hook => {
-						clientScript += `  ${processBinding(json, hook.code, 'template')}\n`;
+						clientScript += `  ${processBinding(hook.code, 'template', options)};\n`;
 					});
 				}
 
 				clientScript += '</script>';
 			}
 
-			// Generate styles (including CSS-in-JS)
-			let styleContent = '';
-			if (css && css.trim().length > 0) {
-				styleContent = css;
+			// Generate styles
+			let styles = '';
+			if (css?.trim()) {
+				styles += css;
 			}
 
 			// Add CSS-in-JS styles
-			if (options.cssInJs && options.cssInJs.size > 0) {
+			if (options.cssInJs) {
 				options.cssInJs.forEach((cssCode, className) => {
 					const cssString = cssObjectToString(cssCode);
-					if (cssString) {
-						styleContent += `.${className} {\n${cssString}}\n\n`;
+					if (cssString.trim()) {
+						styles += `.${className} {\n${cssString}}\n\n`;
 					}
 				});
 			}
 
-			// Wrap styles if we have any
-			if (styleContent.trim()) {
-				styleContent = `\n<style>\n${styleContent.trim()}\n</style>`;
+			if (styles.trim()) {
+				styles = `\n<style>\n${styles.trim()}\n</style>`;
 			}
 
-			// Combine everything
-			let finalContent = '';
+			// Assemble final output
+			let output = '';
 
-			// Add frontmatter if we have any
-			if (frontmatterContent.trim()) {
-				finalContent += '---\n' + frontmatterContent.trim() + '\n---\n\n';
+			if (frontmatter.trim()) {
+				output += '---\n' + frontmatter.trim() + '\n---\n\n';
 			}
 
-			// Add template
-			finalContent += templateContent;
+			output += template;
+			output += clientScript;
+			output += styles;
 
-			// Add client script
-			finalContent += clientScript;
-
-			// Add styles
-			finalContent += styleContent;
-
-			// Run pre-code plugins
+			// Run code plugins
 			if (options.plugins) {
-				finalContent = runPreCodePlugins({ json, code: finalContent, plugins: options.plugins });
+				output = runPreCodePlugins({ json, code: output, plugins: options.plugins });
 			}
 
-			// Format with Prettier for .astro files
+			// Format output
 			if (options.prettier !== false) {
 				try {
-					finalContent = format(finalContent, {
-						parser: 'html',
-						plugins: [
-							require('prettier/parser-html'),
-							require('prettier/parser-typescript'),
-							require('prettier/parser-postcss'),
-						],
-					});
+					// Note: Astro formatting would need astro prettier plugin
+					// For now, basic HTML formatting
+					output = output.replace(/>\s*</g, '>\n<');
 				} catch (err) {
-					console.warn('Could not format Astro component', err);
+					console.warn('Could not format Astro component:', err);
 				}
 			}
 
-			// Run post-code plugins
 			if (options.plugins) {
-				finalContent = runPostCodePlugins({ json, code: finalContent, plugins: options.plugins });
+				output = runPostCodePlugins({ json, code: output, plugins: options.plugins });
 			}
 
-			return finalContent;
+			return output;
 		};
